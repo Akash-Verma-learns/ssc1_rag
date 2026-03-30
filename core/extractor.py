@@ -302,15 +302,35 @@ RAG_QUERIES = {
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _clean_json(text: str) -> str:
-    """Strip markdown code fences from LLM output."""
+    """Strip markdown code fences and extract first valid JSON object."""
     text = re.sub(r"```(?:json)?", "", text).strip()
     text = text.strip("`").strip()
-    # Find first { and last }
+    # Find first { then walk to find its matching closing }
     start = text.find("{")
-    end = text.rfind("}") + 1
-    if start >= 0 and end > start:
-        return text[start:end]
-    return text
+    if start < 0:
+        return text
+    depth = 0
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text[start:], start):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i+1]
+    return text[start:]
 
 
 def extract_clause(
@@ -422,6 +442,8 @@ def extract_all_clauses(doc_name: str, model: str = OLLAMA_MODEL) -> dict:
     """
     Run extraction for all 10 clause types and return combined results.
     """
+    if not model:
+        model = OLLAMA_MODEL
     results = {}
     clause_types = list(EXTRACTION_PROMPTS.keys())
 

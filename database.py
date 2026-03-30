@@ -59,11 +59,12 @@ class RFP(Base):
     bu               = Column(String(150))
     classification   = Column(String(50))
     state            = Column(String(100))
-    offering         = Column(String(150))
-    solutions        = Column(String(150))
+    country          = Column(String(100))          # ← added
+    offering         = Column(String(500))
+    solutions        = Column(String(500))
     file_name        = Column(String(300))
     job_id           = Column(String(50), unique=True, index=True)
-    status           = Column(String(30), default="queued")   # queued / processing / completed / failed
+    status           = Column(String(30), default="queued")
     progress         = Column(Integer, default=0)
     current_step     = Column(String(100), default="")
     error_message    = Column(Text, nullable=True)
@@ -80,11 +81,11 @@ class ClauseResult(Base):
 
     id                    = Column(Integer, primary_key=True, index=True)
     rfp_id                = Column(Integer, ForeignKey("rfps.id"), nullable=False)
-    clause_type           = Column(String(50))    # liability, insurance, scope, etc.
+    clause_type           = Column(String(50))
     clause_text           = Column(Text)
     clause_reference      = Column(String(200))
     page_no               = Column(String(20))
-    risk_level            = Column(String(30))    # HIGH / MEDIUM / ACCEPTABLE / LOW / NEEDS_REVIEW
+    risk_level            = Column(String(30))
     risk_description      = Column(Text)
     auto_remark           = Column(Text)
     needs_exception       = Column(Boolean, default=False)
@@ -113,6 +114,15 @@ class Comment(Base):
 def init_db():
     """Create tables and seed default admin user if not exists."""
     Base.metadata.create_all(bind=engine)
+
+    # Add country column to existing deployments if it doesn't exist
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE rfps ADD COLUMN IF NOT EXISTS country VARCHAR(100)"))
+            conn.commit()
+    except Exception:
+        pass  # column already exists or DB doesn't support IF NOT EXISTS
 
     from auth import hash_password
     db = SessionLocal()
