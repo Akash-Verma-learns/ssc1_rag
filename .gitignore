@@ -7,3 +7,6 @@ outputs/
 *.docx 
 __pycache__/ 
 *.pyc 
+*.bak 
+debug_*.py 
+fix_*.py 

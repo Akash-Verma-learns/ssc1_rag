@@ -274,23 +274,41 @@ def run_pipeline_task(rfp_id: int, file_path: str, job_id: str):
 
         update("processing", 35, "Ingesting into vector store")
         ingest_chunks(chunks, doc_id=doc_name)
-
-        # Metadata extraction — runs immediately after ingestion so it always
-        # completes even if the clause extraction fails for any reason.
+        # ── Metadata extraction ───────────────────────────────────────────────
+        # Runs immediately after ingestion. Always overwrites blank/placeholder
+        # values so the LLM result is always used.
         update("processing", 45, "Extracting document metadata")
         try:
             from core.metadata_extractor import extract_metadata
             meta = extract_metadata(doc_name)
-            if not rfp.opportunity_name and meta.get("opportunity_name"):
-                rfp.opportunity_name = meta["opportunity_name"]
-                print(f"[Pipeline] Auto-filled opportunity_name: {rfp.opportunity_name!r}")
-            if not rfp.client_name and meta.get("client_name"):
-                rfp.client_name = meta["client_name"]
-                print(f"[Pipeline] Auto-filled client_name: {rfp.client_name!r}")
-            db.commit()
-        except Exception as meta_err:
-            print(f"[Pipeline] Metadata extraction skipped: {meta_err}")
+            opp_name = meta.get("opportunity_name")
+            cli_name = meta.get("client_name")
+            meta_err_msg = meta.get("error")
 
+            if meta_err_msg:
+                print(f"[Pipeline] Metadata extractor warning: {meta_err_msg}")
+
+            # Always overwrite if LLM returned something meaningful
+            if opp_name and len(opp_name.strip()) > 5:
+                rfp.opportunity_name = opp_name.strip()
+                print(f"[Pipeline] opportunity_name set: {rfp.opportunity_name!r}")
+            else:
+                print(f"[Pipeline] opportunity_name not extracted (got: {opp_name!r})")
+
+            if cli_name and len(cli_name.strip()) > 2:
+                rfp.client_name = cli_name.strip()
+                print(f"[Pipeline] client_name set: {rfp.client_name!r}")
+            else:
+                print(f"[Pipeline] client_name not extracted (got: {cli_name!r})")
+
+            db.commit()
+        except Exception as meta_exc:
+            print(f"[Pipeline] Metadata extraction FAILED: {meta_exc}")
+        # ── End metadata extraction ───────────────────────────────────────────
+
+
+        # Metadata extraction — runs immediately after ingestion so it always
+        # completes even if the clause extraction fails for any reason.
         update("processing", 50, "Extracting clauses (with learning context)")
 
         # KEY INTEGRATION POINT:
@@ -780,6 +798,41 @@ def submit_feedback(
         except Exception as le:
             print(f"[Feedback] Learning example skipped: {le}")
 
+
+    # ── Live risk-level update ─────────────────────────────────────────────
+    # Recompute adjusted_risk_level for all matching RFPs so the review page
+    # reflects feedback immediately without needing a re-upload.
+    try:
+        from rules.feedback_engine import get_adjustment as _gadj
+        _norm_u = lambda t: (t or "").strip().upper()
+        _matched_rfps = db.query(RFP).filter(RFP.status == "completed").all()
+        _updated = 0
+        for _r in _matched_rfps:
+            _ro, _rs = _parse_offering_solutions(_r.offering or "", _r.solutions or "")
+            _r_off = _ro[0] if _ro else ""
+            _r_sol = _rs[0] if _rs else ""
+            _no = _norm_u(_r_off); _to = _norm_u(off)
+            if not (_to in _no or _no in _to or not _to):
+                continue
+            _cr2 = db.query(ClauseResult).filter(
+                ClauseResult.rfp_id == _r.id,
+                ClauseResult.clause_type == clause_type,
+            ).first()
+            if not _cr2:
+                continue
+            _adj2 = _gadj(clause_type, _r_off, _r_sol, _cr2.risk_level, db)
+            _cr2.adjusted_risk_level   = _adj2["adjusted_risk_level"] if _adj2["applied"] else None
+            _cr2.adjustment_reason     = _adj2["reason"]              if _adj2["applied"] else None
+            _cr2.adjustment_confidence = str(_adj2["confidence"])     if _adj2["applied"] else None
+            _cr2.feedback_count        = _adj2["feedback_count"]
+            _updated += 1
+        if _updated:
+            db.commit()
+            print(f"[Feedback] Live risk update: {clause_type} → {_updated} clause result(s) updated")
+    except Exception as _ue:
+        print(f"[Feedback] Live risk update skipped: {_ue}")
+    # ── end live risk-level update ─────────────────────────────────────────
+
     print(f"[Feedback] {action.upper()} — {current_user.email!r} "
           f"rfp={rfp_id} {clause_type!r} {body.agreement!r} "
           f"offering={off!r} solution={sol!r}")
@@ -886,6 +939,29 @@ def delete_my_feedback(
 # ══════════════════════════════════════════════════════════════════════════════
 # FEEDBACK INSIGHTS + AUDIT LOG (admin only)
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/feedback/summary")
+def feedback_summary(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """
+    Returns the four headline stats shown in the Insights panel.
+    """
+    from rules.feedback_engine import get_feedback_insights
+    total = db.query(ClauseFeedback).count()
+    insights = get_feedback_insights(db)
+    strong = sum(1 for i in insights if i["has_strong_signal"])
+    rules_count    = db.query(LearnedRule).filter(LearnedRule.is_active == True).count()
+    examples_count = db.query(LearningExample).filter(LearningExample.is_active == True).count()
+    return {
+        "total_feedback":  total,
+        "strong_signal":   strong,
+        "active_rules":    rules_count,
+        "active_examples": examples_count,
+    }
+
 
 @router.get("/feedback/insights")
 def feedback_insights(
@@ -1104,7 +1180,33 @@ def delete_user(
     return {"deleted": True}
 
 # ── DELETE any feedback record (admin) ────────────────────────────────────────
+@router.delete("/feedback/reset-all")
+def reset_all_feedback(
+    confirm: str = Query(..., description="Must be 'yes-delete-everything'"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """
+    Admin: wipe ALL feedback, learning examples, and learned rules globally.
+    Requires ?confirm=yes-delete-everything as a safety guard.
+    Use this to reset mock/demo data.
+    """
+    if confirm != "yes-delete-everything":
+        raise HTTPException(400, "Pass ?confirm=yes-delete-everything to proceed.")
 
+    examples_deleted = db.query(LearningExample).delete(synchronize_session=False)
+    rules_deleted    = db.query(LearnedRule).delete(synchronize_session=False)
+    feedback_deleted = db.query(ClauseFeedback).delete(synchronize_session=False)
+    db.commit()
+
+    print(f"[RESET] Deleted {feedback_deleted} feedback, "
+          f"{examples_deleted} examples, {rules_deleted} rules")
+
+    return {
+        "feedback_deleted":  feedback_deleted,
+        "examples_deleted":  examples_deleted,
+        "rules_deleted":     rules_deleted,
+    }
 @router.delete("/feedback/{feedback_id}")
 def admin_delete_feedback(
     feedback_id: int,
@@ -1148,30 +1250,3 @@ def reset_rfp_feedback(
 
 # ── NUKE all feedback + learning data globally (admin) ────────────────────────
 
-@router.delete("/feedback/reset-all")
-def reset_all_feedback(
-    confirm: str = Query(..., description="Must be 'yes-delete-everything'"),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
-):
-    """
-    Admin: wipe ALL feedback, learning examples, and learned rules globally.
-    Requires ?confirm=yes-delete-everything as a safety guard.
-    Use this to reset mock/demo data.
-    """
-    if confirm != "yes-delete-everything":
-        raise HTTPException(400, "Pass ?confirm=yes-delete-everything to proceed.")
-
-    examples_deleted = db.query(LearningExample).delete(synchronize_session=False)
-    rules_deleted    = db.query(LearnedRule).delete(synchronize_session=False)
-    feedback_deleted = db.query(ClauseFeedback).delete(synchronize_session=False)
-    db.commit()
-
-    print(f"[RESET] Deleted {feedback_deleted} feedback, "
-          f"{examples_deleted} examples, {rules_deleted} rules")
-
-    return {
-        "feedback_deleted":  feedback_deleted,
-        "examples_deleted":  examples_deleted,
-        "rules_deleted":     rules_deleted,
-    }

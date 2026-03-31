@@ -35,8 +35,8 @@ from typing import Optional
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MIN_FEEDBACK          = 3     # minimum feedback points before we trust the aggregate
-CONSENSUS_THRESHOLD   = 0.60  # fraction of feedback in one direction required
+MIN_FEEDBACK          = 1    # minimum feedback points before we trust the aggregate
+CONSENSUS_THRESHOLD   = 0.50  # fraction of feedback in one direction required
 
 RISK_ORDER = ["ACCEPTABLE", "LOW", "MEDIUM", "HIGH"]   # ascending severity
 
