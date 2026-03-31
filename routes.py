@@ -1,37 +1,40 @@
 """
 Routes
 ------
-All FastAPI endpoints:
-  /auth/login, /auth/me
-  /rfps, /rfps/upload, /rfps/{id}, /rfps/{id}/status, /rfps/{id}/download
-  /rfps/{id}/comments
-  /rfps/{id}/complete
-  /users
-  /offering-solutions  ← new: returns the offering→solutions mapping
+All FastAPI endpoints. Wired into api.py via app.include_router(router).
 
-Changes from v1:
-  - classification field now stores BU code: TRF | ERC | DEALS | TAX
-  - offering + solutions stored as JSON arrays (up to 5 pairs each)
-  - uploaded_by_name hidden from non-admin users in list view
-  - opportunity_name and client_name always returned (never omitted)
+Feedback + Learning additions:
+  POST /rfps/{id}/clauses/{type}/feedback   — submit/update feedback (any user)
+  GET  /rfps/{id}/clauses/{type}/feedback   — view feedback for one clause
+  GET  /rfps/{id}/feedback                  — summary across all 10 clauses
+  DEL  /rfps/{id}/clauses/{type}/feedback   — retract own feedback
+  GET  /feedback/insights                   — aggregated learning signal (admin)
+  GET  /feedback/log                        — full audit log (admin)
+  POST /feedback/synthesise                 — trigger LLM rule synthesis (admin)
+  GET  /feedback/rules                      — list all learned rules (admin)
+  PATCH /feedback/rules/{id}               — activate/deactivate/edit rule (admin)
+  GET  /feedback/examples                   — list few-shot examples (admin)
+  PATCH /feedback/examples/{id}            — adjust usefulness score (admin)
 """
 
 import uuid
 import json
-import shutil
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from database import get_db, User, RFP, ClauseResult, Comment
+from database import (
+    get_db, User, RFP, ClauseResult, Comment,
+    ClauseFeedback, LearningExample, LearnedRule,
+)
 from auth import (
     verify_password, create_token, hash_password,
-    get_current_user, require_admin
+    get_current_user, require_admin,
 )
 
 router = APIRouter()
@@ -41,7 +44,6 @@ OUTPUT_DIR = Path("./outputs")
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# Load offering→solutions map at startup
 _OFFERING_SOLUTIONS_PATH = Path(__file__).parent / "offering_solutions.json"
 try:
     with open(_OFFERING_SOLUTIONS_PATH, "r", encoding="utf-8") as f:
@@ -49,8 +51,18 @@ try:
 except FileNotFoundError:
     OFFERING_SOLUTIONS = {}
 
+VALID_CLAUSE_TYPES = {
+    "liability", "insurance", "scope", "payment",
+    "deliverables", "personnel", "ld", "penalties",
+    "termination", "eligibility",
+}
+VALID_AGREEMENTS  = {"agree", "too_high", "too_low", "incorrect"}
+VALID_RISK_LEVELS = {"HIGH", "MEDIUM", "LOW", "ACCEPTABLE", "NEEDS_REVIEW"}
 
-# ── Pydantic schemas ───────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Pydantic schemas
+# ══════════════════════════════════════════════════════════════════════════════
 
 class LoginRequest(BaseModel):
     email: str
@@ -66,129 +78,180 @@ class CreateUserRequest(BaseModel):
     password: str
     role: str = "reviewer"
 
+class FeedbackRequest(BaseModel):
+    """
+    agreement:
+      agree      — system assessment is correct for this offering/solution
+      too_high   — system over-stated the risk for this type of work
+      too_low    — system under-stated the risk for this type of work
+      incorrect  — reasoning is wrong (explain in feedback_comment)
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+    suggested_risk_level (optional):
+      HIGH | MEDIUM | LOW | ACCEPTABLE | NEEDS_REVIEW
 
-def user_to_dict(user: User) -> dict:
+    feedback_comment (optional):
+      Free text. If provided on a non-agree submission, a LearningExample
+      is automatically created and injected into future LLM prompts for
+      matching offering/solution/clause combinations.
+    """
+    agreement: str
+    suggested_risk_level: Optional[str] = None
+    feedback_comment: Optional[str] = None
+
+class SynthesiseRequest(BaseModel):
+    clause_type: str
+    offering: str
+    solution: str
+    force: bool = False   # bypass minimum-feedback guard (for testing/demos)
+
+class RuleUpdateRequest(BaseModel):
+    is_active: Optional[bool] = None
+    rule_text: Optional[str]  = None   # admin manual override of synthesised text
+
+class ExampleUpdateRequest(BaseModel):
+    is_active:        Optional[bool] = None
+    usefulness_score: Optional[int]  = None   # 1 = normal, 2 = high, 3 = essential
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Serialisers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def user_to_dict(u: User) -> dict:
     return {
-        "id": user.id,
-        "name": user.name,
-        "email": user.email,
-        "role": user.role,
-        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "id": u.id, "name": u.name, "email": u.email, "role": u.role,
+        "created_at": u.created_at.isoformat() if u.created_at else None,
     }
-
 
 def clause_to_dict(c: ClauseResult) -> dict:
     return {
-        "clause_text": c.clause_text,
-        "clause_reference": c.clause_reference,
-        "page_no": c.page_no,
-        "risk_level": c.risk_level,
-        "risk_description": c.risk_description,
-        "auto_remark": c.auto_remark,
+        "clause_text":             c.clause_text,
+        "clause_reference":        c.clause_reference,
+        "page_no":                 c.page_no,
+        "risk_level":              c.risk_level,           # raw system output
+        "risk_description":        c.risk_description,
+        "auto_remark":             c.auto_remark,
         "needs_exception_approval": c.needs_exception,
-        "needs_eqcr": c.needs_eqcr,
-        "deviation_suggested": c.deviation_suggested,
+        "needs_eqcr":              c.needs_eqcr,
+        "deviation_suggested":     c.deviation_suggested,
+        # Feedback-engine adjustments
+        "adjusted_risk_level":     c.adjusted_risk_level,
+        "effective_risk_level":    c.adjusted_risk_level or c.risk_level,  # use this in UI
+        "adjustment_reason":       c.adjustment_reason,
+        "adjustment_confidence":   float(c.adjustment_confidence) if c.adjustment_confidence else None,
+        "feedback_count":          c.feedback_count or 0,
+        # Learning
+        "learned_rule_applied":    c.learned_rule_applied or False,
     }
 
+def feedback_to_dict(fb: ClauseFeedback) -> dict:
+    return {
+        "id": fb.id, "rfp_id": fb.rfp_id, "clause_type": fb.clause_type,
+        "user_id": fb.user_id,
+        "user_name": fb.user.name if fb.user else "Unknown",
+        "user_role": fb.user.role if fb.user else "",
+        "agreement": fb.agreement,
+        "suggested_risk_level": fb.suggested_risk_level,
+        "feedback_comment": fb.feedback_comment,
+        "system_risk_level": fb.system_risk_level,
+        "offering": fb.offering, "solution": fb.solution, "bu": fb.bu,
+        "created_at": fb.created_at.isoformat() if fb.created_at else None,
+    }
+
+def rule_to_dict(r: LearnedRule) -> dict:
+    try:    threshold_notes = json.loads(r.threshold_notes_json or "{}")
+    except: threshold_notes = {}
+    return {
+        "id": r.id, "clause_type": r.clause_type,
+        "offering": r.offering, "solution": r.solution,
+        "rule_text": r.rule_text, "threshold_notes": threshold_notes,
+        "key_differences": r.key_differences, "confidence": r.confidence,
+        "feedback_count_at_gen": r.feedback_count_at_gen,
+        "is_active": r.is_active,
+        "generated_at": r.generated_at.isoformat() if r.generated_at else None,
+    }
+
+def example_to_dict(e: LearningExample) -> dict:
+    return {
+        "id": e.id, "feedback_id": e.feedback_id,
+        "clause_type": e.clause_type, "offering": e.offering,
+        "solution": e.solution, "bu": e.bu,
+        "clause_snippet": e.clause_snippet,
+        "system_risk_level": e.system_risk_level,
+        "correct_risk_level": e.correct_risk_level,
+        "reviewer_reason": e.reviewer_reason,
+        "usefulness_score": e.usefulness_score, "is_active": e.is_active,
+        "created_at": e.created_at.isoformat() if e.created_at else None,
+    }
 
 def _parse_offering_solutions(offering_str: str, solutions_str: str):
-    """
-    Parse offering and solutions fields. Always returns two plain lists.
-    Handles:
-      - New format: JSON array  '["ENERGY & RENEWABLES", "URBAN INFRA"]'
-      - Old format: plain string 'ENERGY & RENEWABLES'
-      - Empty / None
-    """
-    def _parse_one(raw):
-        if not raw:
-            return []
+    def _p(raw):
+        if not raw: return []
         raw = str(raw).strip()
-        if not raw:
-            return []
         if raw.startswith("["):
             try:
                 parsed = json.loads(raw)
                 if isinstance(parsed, list):
                     return [str(x).strip() for x in parsed if x and str(x).strip()]
-            except (json.JSONDecodeError, ValueError):
-                pass
-        # Plain string fallback
+            except Exception: pass
         return [raw]
+    return _p(offering_str), _p(solutions_str)
 
-    return _parse_one(offering_str), _parse_one(solutions_str)
-
-
-def rfp_to_dict(rfp: RFP, include_clauses: bool = False, viewer_role: str = "reviewer") -> dict:
-    """
-    Serialize an RFP to a dict.
-    - opportunity_name and client_name are always included (even if empty — shown as "" not null)
-    - uploaded_by_name is only included for admin viewers
-    - offering/solutions are returned as parsed arrays
-    """
+def rfp_to_dict(rfp: RFP, include_clauses=False, viewer_role="reviewer") -> dict:
     offerings, solutions = _parse_offering_solutions(rfp.offering or "", rfp.solutions or "")
-
     d = {
         "id": rfp.id,
-        # Always return these even if blank; frontend shows "—" for empty
         "opportunity_name": rfp.opportunity_name or "",
-        "client_name": rfp.client_name or "",
-        "bu": rfp.bu or "",
-        # classification now stores BU code: TRF | ERC | DEALS | TAX
-        "bu_code": rfp.classification or "",
-        "state": rfp.state or "",
-        "country": rfp.country or "",
-        # Multi-offering support: arrays of up to 5
-        "offerings": offerings,
-        "solutions": solutions,
-        # Legacy single-value fields — old Lovable frontend reads these
-        # If DB has plain string (old upload), return it directly; else first element of array
-        "offering":  offerings[0] if offerings else (rfp.offering or ""),
-        "solution":  solutions[0] if solutions else (rfp.solutions or ""),
-        # Also expose raw DB strings so frontend can display them
-        "offering_raw":  rfp.offering or "",
-        "solutions_raw": rfp.solutions or "",
-        "file_name": rfp.file_name or "",
-        "job_id": rfp.job_id or "",
-        "status": rfp.status or "queued",
-        "progress": rfp.progress or 0,
-        "current_step": rfp.current_step or "",
-        "error_message": rfp.error_message,
-        "created_at": rfp.created_at.isoformat() if rfp.created_at else None,
+        "client_name":      rfp.client_name or "",
+        "bu":               rfp.bu or "",
+        "bu_code":          rfp.classification or "",
+        "state":            rfp.state or "",
+        "country":          rfp.country or "",
+        "offerings":        offerings,
+        "solutions":        solutions,
+        "offering":         offerings[0] if offerings else (rfp.offering or ""),
+        "solution":         solutions[0] if solutions else (rfp.solutions or ""),
+        "offering_raw":     rfp.offering or "",
+        "solutions_raw":    rfp.solutions or "",
+        "file_name":        rfp.file_name or "",
+        "job_id":           rfp.job_id or "",
+        "status":           rfp.status or "queued",
+        "progress":         rfp.progress or 0,
+        "current_step":     rfp.current_step or "",
+        "error_message":    rfp.error_message,
+        "created_at":       rfp.created_at.isoformat() if rfp.created_at else None,
     }
-
-    # Requestor name: admins only
-    if viewer_role == "admin":
-        d["uploaded_by_name"] = rfp.uploaded_by_user.name if rfp.uploaded_by_user else ""
-    else:
-        d["uploaded_by_name"] = None  # hidden
-
+    d["uploaded_by_name"] = (rfp.uploaded_by_user.name if rfp.uploaded_by_user else "") \
+        if viewer_role == "admin" else None
     if include_clauses:
-        clauses = {}
-        for c in rfp.clause_results:
-            clauses[c.clause_type] = clause_to_dict(c)
-        d["clauses"] = clauses
-
+        d["clauses"] = {c.clause_type: clause_to_dict(c) for c in rfp.clause_results}
     return d
 
 
-# ── Background task: run the full pipeline ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Background pipeline task — learning-aware
+# ══════════════════════════════════════════════════════════════════════════════
 
 def run_pipeline_task(rfp_id: int, file_path: str, job_id: str):
     """
-    Runs in background after upload.
-    Updates RFP status + progress in DB as it goes.
-    Saves clause results to DB when done.
+    Full analysis pipeline — integrates the learning loop:
+
+    1. parse → ingest (unchanged)
+    2. extract_all_clauses() receives db + offering/solution →
+       few-shot examples are injected into each LLM prompt automatically
+    3. get_learned_rule() checks for a synthesised rule per clause →
+       flagged on ClauseResult if active
+    4. evaluate_clause() applies static risk rules (or learned rule overrides)
+    5. get_adjustment() applies feedback-engine numeric adjustments on top
+    6. All saved to DB with full learning metadata
     """
     from database import SessionLocal
-    from pipeline import run_pipeline
 
     db = SessionLocal()
     try:
         rfp = db.query(RFP).filter(RFP.id == rfp_id).first()
 
-        def update(status: str, progress: int, step: str):
+        def update(status, progress, step):
             rfp.status = status
             rfp.progress = progress
             rfp.current_step = step
@@ -196,72 +259,136 @@ def run_pipeline_task(rfp_id: int, file_path: str, job_id: str):
 
         update("processing", 10, "Parsing document")
 
-        output_path = str(OUTPUT_DIR / f"{job_id}_ssc1.docx")
+        offerings, solutions = _parse_offering_solutions(rfp.offering or "", rfp.solutions or "")
+        primary_offering = offerings[0] if offerings else ""
+        primary_solution = solutions[0] if solutions else ""
 
-        result = run_pipeline(
-            rfp_path=file_path,
-            output_path=output_path,
-            model="llama3.2",
-        )
+        from core.parser import parse_document
+        from core.vector_store import ingest_chunks
+        from core.extractor import extract_all_clauses
+        from rules.risk_engine import evaluate_clause, RiskResult
 
-        update("processing", 75, "Extracting document metadata")
+        doc_name = Path(file_path).name
+        chunks = parse_document(file_path)
+        print(f"[Pipeline] {len(chunks)} chunks extracted")
 
-        # ── Auto-extract opportunity_name and client_name if blank ────────────
+        update("processing", 35, "Ingesting into vector store")
+        ingest_chunks(chunks, doc_id=doc_name)
+
+        # Metadata extraction — runs immediately after ingestion so it always
+        # completes even if the clause extraction fails for any reason.
+        update("processing", 45, "Extracting document metadata")
         try:
             from core.metadata_extractor import extract_metadata
-            from pathlib import Path as _Path
-            doc_name = _Path(file_path).name
             meta = extract_metadata(doc_name)
-
-            # Only fill in if the user left them blank at upload time
             if not rfp.opportunity_name and meta.get("opportunity_name"):
                 rfp.opportunity_name = meta["opportunity_name"]
                 print(f"[Pipeline] Auto-filled opportunity_name: {rfp.opportunity_name!r}")
-
             if not rfp.client_name and meta.get("client_name"):
                 rfp.client_name = meta["client_name"]
                 print(f"[Pipeline] Auto-filled client_name: {rfp.client_name!r}")
-
             db.commit()
         except Exception as meta_err:
             print(f"[Pipeline] Metadata extraction skipped: {meta_err}")
 
-        update("processing", 80, "Saving results")
+        update("processing", 50, "Extracting clauses (with learning context)")
+
+        # KEY INTEGRATION POINT:
+        # db + offering/solution passed so extractor can inject few-shot examples
+        extraction_results = extract_all_clauses(
+            doc_name=doc_name,
+            model="llama3.2",
+            offering=primary_offering,
+            solution=primary_solution,
+            db=db,
+        )
+
+        update("processing", 70, "Evaluating risk + checking learned rules")
 
         CLAUSE_ORDER = [
             "liability", "insurance", "scope", "payment", "deliverables",
-            "personnel", "ld", "penalties", "termination", "eligibility"
+            "personnel", "ld", "penalties", "termination", "eligibility",
         ]
 
-        for clause_type in CLAUSE_ORDER:
-            clause_data = result.get("results", {}).get(clause_type, {})
-            extracted = clause_data.get("extracted", {})
+        # Check which clauses have an active learned rule for this offering/solution
+        from rules.learning_store import get_learned_rule
+        learned_rule_ids: dict = {}
+        for ct in CLAUSE_ORDER:
+            rule_text = get_learned_rule(ct, primary_offering, primary_solution, db)
+            if rule_text:
+                rule_row = db.query(LearnedRule).filter(
+                    LearnedRule.clause_type == ct,
+                    LearnedRule.is_active == True,
+                ).first()
+                if rule_row:
+                    learned_rule_ids[ct] = rule_row.id
+                    print(f"[Pipeline] Learned rule active: {ct} / {primary_offering}")
 
-            risk_level = clause_data.get("risk_level", "NEEDS_REVIEW")
-            risk_desc  = clause_data.get("risk_description", "")
+        update("processing", 82, "Saving results")
 
-            auto_remark        = extracted.get("auto_remark", "")
-            needs_exception    = extracted.get("needs_exception_approval", False)
-            needs_eqcr         = extracted.get("needs_eqcr", False)
-            deviation          = extracted.get("deviation_suggested", "")
+        for ct in CLAUSE_ORDER:
+            ext  = extraction_results.get(ct, {})
+            exd  = ext.get("extracted", {})
+            l_app = ext.get("learning_applied", False)
 
-            clause_ref = extracted.get("clause_reference", "")
-            page_no    = str(extracted.get("page_no", "") or "")
+            try:
+                risk = evaluate_clause(ct, exd)
+            except Exception as e:
+                risk = RiskResult(
+                    clause_name=ct, risk_level="NEEDS_REVIEW",
+                    risk_description=f"Evaluation failed: {e}", auto_remark="",
+                )
 
-            clause_result = ClauseResult(
-                rfp_id               = rfp_id,
-                clause_type          = clause_type,
-                clause_text          = extracted.get("clause_text") or extracted.get("summary", ""),
-                clause_reference     = clause_ref,
-                page_no              = page_no,
-                risk_level           = risk_level,
-                risk_description     = risk_desc,
-                auto_remark          = auto_remark,
-                needs_exception      = bool(needs_exception),
-                needs_eqcr           = bool(needs_eqcr),
-                deviation_suggested  = deviation or "",
+            # Feedback-engine numeric adjustment
+            try:
+                from rules.feedback_engine import get_adjustment
+                adj = get_adjustment(ct, primary_offering, primary_solution, risk.risk_level, db)
+                adj_level  = adj["adjusted_risk_level"] if adj["applied"] else None
+                adj_reason = adj["reason"] if adj["applied"] else None
+                adj_conf   = str(adj["confidence"]) if adj["applied"] else None
+                adj_count  = adj["feedback_count"]
+            except Exception:
+                adj_level = adj_reason = adj_conf = None
+                adj_count = 0
+
+            cr = ClauseResult(
+                rfp_id=rfp_id, clause_type=ct,
+                clause_text=exd.get("clause_text") or exd.get("summary", ""),
+                clause_reference=exd.get("clause_reference", ""),
+                page_no=str(exd.get("page_no", "") or ""),
+                risk_level=risk.risk_level,
+                risk_description=risk.risk_description,
+                auto_remark=exd.get("auto_remark", ""),
+                needs_exception=bool(exd.get("needs_exception_approval", False)),
+                needs_eqcr=bool(exd.get("needs_eqcr", False)),
+                deviation_suggested=exd.get("deviation_suggested", "") or "",
+                adjusted_risk_level=adj_level,
+                adjustment_reason=adj_reason,
+                adjustment_confidence=adj_conf,
+                feedback_count=adj_count,
+                learned_rule_applied=ct in learned_rule_ids,
+                learned_rule_id=learned_rule_ids.get(ct),
             )
-            db.add(clause_result)
+            db.add(cr)
+
+        # Write DOCX output
+        try:
+            from output.writer import build_table_rows, fill_ssc1_table
+            table_rows = build_table_rows({
+                ct: {
+                    "extracted": extraction_results.get(ct, {}).get("extracted", {}),
+                    "risk": None,
+                }
+                for ct in CLAUSE_ORDER
+            })
+            fill_ssc1_table(
+                table_rows,
+                "document_for_format.docx",
+                str(OUTPUT_DIR / f"{job_id}_ssc1.docx"),
+                rfp_name=rfp.opportunity_name or job_id,
+            )
+        except Exception as docx_err:
+            print(f"[Pipeline] DOCX output skipped: {docx_err}")
 
         rfp.status = "completed"
         rfp.progress = 100
@@ -271,9 +398,7 @@ def run_pipeline_task(rfp_id: int, file_path: str, job_id: str):
 
     except Exception as e:
         db.query(RFP).filter(RFP.id == rfp_id).update({
-            "status": "failed",
-            "error_message": str(e),
-            "current_step": "Failed",
+            "status": "failed", "error_message": str(e), "current_step": "Failed",
         })
         db.commit()
         print(f"[Pipeline] RFP {rfp_id} FAILED: {e}")
@@ -282,37 +407,26 @@ def run_pipeline_task(rfp_id: int, file_path: str, job_id: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AUTH ROUTES
+# AUTH
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.post("/auth/login")
 def login(body: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == body.email).first()
     if not user or not verify_password(body.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    token = create_token(user.id)
+        raise HTTPException(401, "Invalid email or password")
     return {
-        "access_token": token,
+        "access_token": create_token(user.id),
         "token_type": "bearer",
         "user": user_to_dict(user),
     }
-
 
 @router.get("/auth/me")
 def me(current_user: User = Depends(get_current_user)):
     return user_to_dict(current_user)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# OFFERING-SOLUTIONS MAP
-# ══════════════════════════════════════════════════════════════════════════════
-
 @router.get("/offering-solutions")
 def get_offering_solutions(current_user: User = Depends(get_current_user)):
-    """
-    Returns the full offering → solutions mapping.
-    Frontend uses this to populate the linked dropdowns in the upload modal.
-    """
     return OFFERING_SOLUTIONS
 
 
@@ -336,166 +450,86 @@ async def upload_rfp(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    """
-    Upload an RFP. Uses raw form parsing so it works regardless of which
-    field names the frontend sends. Logs all received fields for debugging.
-    """
-    # Parse multipart form — captures ALL fields whatever their names are
     form = await request.form()
-    
-    # Log every field received (visible in your uvicorn terminal)
-    print("\n[UPLOAD DEBUG] Fields received from frontend:")
-    for key in form.keys():
-        val = form[key]
-        if hasattr(val, 'filename'):
-            print(f"  FILE  {key!r} = {val.filename!r} ({val.content_type})")
-        else:
-            print(f"  FIELD {key!r} = {str(val)!r}")
-    print()
 
-    # ── File ─────────────────────────────────────────────────────────────────
-    # Try common file field names
+    # Find the file field regardless of what name Lovable used
     file_obj = form.get("file") or form.get("rfp_file") or form.get("document")
     if file_obj is None:
-        # Take first UploadFile found regardless of name
-        for key in form.keys():
-            v = form[key]
-            if hasattr(v, 'filename') and v.filename:
+        for k in form.keys():
+            v = form[k]
+            if hasattr(v, "filename") and v.filename:
                 file_obj = v
                 break
     if file_obj is None:
-        raise HTTPException(400, "No file found in upload. Expected a field named 'file'.")
+        raise HTTPException(400, "No file found in upload.")
 
     ext = Path(file_obj.filename).suffix.lower()
     if ext not in (".pdf", ".docx", ".doc"):
-        raise HTTPException(400, f"Only PDF and DOCX files are supported. Got: {ext!r}")
+        raise HTTPException(400, f"Only PDF and DOCX supported.")
 
-    # Build a case-insensitive lookup of ALL form fields
-    # This catches any field name Lovable sends regardless of casing
-    form_lower = {}
-    for k in form.keys():
-        v = form.get(k)
-        if not hasattr(v, "filename"):  # skip file fields
-            form_lower[k.lower().replace(" ", "_").replace("-", "_")] = str(v).strip()
-
-    print("[UPLOAD DEBUG] Normalised field map:")
-    for k, v in sorted(form_lower.items()):
-        print(f"  {k!r} = {v!r}")
-    print()
+    form_lower = {
+        k.lower().replace(" ", "_").replace("-", "_"): str(form.get(k)).strip()
+        for k in form.keys()
+        if not hasattr(form.get(k), "filename")
+    }
 
     def _f(*names, default=""):
-        """Look up field by any of the given name variants (case-insensitive)."""
         for name in names:
-            # Try exact name first
             v = form.get(name)
-            if v is not None and not hasattr(v, "filename"):
-                val = str(v).strip()
-                if val:
-                    return val
-            # Try normalised lookup
+            if v is not None and not hasattr(v, "filename") and str(v).strip():
+                return str(v).strip()
             norm = name.lower().replace(" ", "_").replace("-", "_")
             if norm in form_lower and form_lower[norm]:
                 return form_lower[norm]
         return default
 
-    # ── Text fields — every possible variant Lovable might use ───────────────
-    opportunity_name = _f(
-        "opportunity_name", "opportunityName", "Opportunity Name",
-        "opportunityname", "opportunity", "rfp_name", "rfpName", "title"
-    )
-    client_name = _f(
-        "client_name", "clientName", "Client Name",
-        "clientname", "client", "client_organisation", "clientOrganisation"
-    )
-    bu = _f(
-        "bu", "name_of_bu", "nameOfBu", "Name of BU", "nameof_bu",
-        "business_unit", "businessUnit", "buName", "bu_name", "practice"
-    )
-    state = _f(
-        "state", "State", "indian_state", "indianState", "location"
-    )
-    country = _f(
-        "country", "Country", "nation"
-    )
-    bu_code = _f(
-        "bu_code", "buCode", "Bu Code", "bu_code", "BU Code",
-        "classification", "Classification", "bunit", "bCode"
-    ) or "TRF"
-
-    # ── Offering / Solutions ──────────────────────────────────────────────────
-    def _parse_array(raw):
-        """Turn a raw form value into a list. Handles JSON arrays and plain strings."""
-        if not raw:
-            return []
+    def _pa(raw):
+        if not raw: return []
         raw = str(raw).strip()
         if raw.startswith("["):
             try:
-                parsed = json.loads(raw)
-                return [str(x).strip() for x in parsed if x and str(x).strip()]
-            except (json.JSONDecodeError, ValueError):
-                pass
+                return [str(x).strip() for x in json.loads(raw) if x and str(x).strip()]
+            except Exception: pass
         return [raw] if raw else []
 
-    # JSON array format (new frontend) — try all variants
-    raw_offerings = _f(
-        "offerings_json", "offeringsJson", "offerings",
-        "Offerings", "offering_list", "offeringList"
-    )
-    raw_solutions = _f(
-        "solutions_json", "solutionsJson", "solutions",
-        "Solutions", "solution_list", "solutionList", "solution"
-    )
+    opportunity_name = _f("opportunity_name", "opportunityName", "Opportunity Name", "title")
+    client_name = _f("client_name", "clientName", "Client Name", "client")
+    bu      = _f("bu", "name_of_bu", "nameOfBu", "business_unit", "businessUnit")
+    state   = _f("state", "State", "location")
+    country = _f("country", "Country", "nation")
+    bu_code = _f("bu_code", "buCode", "classification", "Classification") or "TRF"
 
-    resolved_offerings = _parse_array(raw_offerings)
-    resolved_solutions  = _parse_array(raw_solutions)
-
-    # Individual row fields: offering_1, offering_2 ... offering_5 (some Lovable builds)
+    raw_off = _f("offerings_json", "offeringsJson", "offerings", "Offerings")
+    raw_sol = _f("solutions_json", "solutionsJson", "solutions", "Solutions", "solution")
+    resolved_off = _pa(raw_off)
+    resolved_sol = _pa(raw_sol)
     for i in range(1, 6):
-        o = _f(f"offering_{i}", f"offering{i}", f"Offering {i}")
-        s = _f(f"solution_{i}", f"solution{i}", f"Solution {i}")
-        if o and o not in resolved_offerings:
-            resolved_offerings.append(o)
-        if s and s not in resolved_solutions:
-            resolved_solutions.append(s)
+        o = _f(f"offering_{i}", f"offering{i}")
+        s = _f(f"solution_{i}", f"solution{i}")
+        if o and o not in resolved_off: resolved_off.append(o)
+        if s and s not in resolved_sol:  resolved_sol.append(s)
+    resolved_off = [x for x in resolved_off if x][:5]
+    resolved_sol = [x for x in resolved_sol  if x][:5]
 
-    resolved_offerings = [x for x in resolved_offerings if x][:5]
-    resolved_solutions  = [x for x in resolved_solutions  if x][:5]
-
-    print(f"[UPLOAD PARSED] opportunity_name={opportunity_name!r}")
-    print(f"[UPLOAD PARSED] client_name={client_name!r}  bu={bu!r}  bu_code={bu_code!r}  state={state!r}")
-    print(f"[UPLOAD PARSED] offerings={resolved_offerings}")
-    print(f"[UPLOAD PARSED] solutions={resolved_solutions}")
-
-    # ── Save file to disk ─────────────────────────────────────────────────────
     job_id    = str(uuid.uuid4())[:8]
     save_path = UPLOAD_DIR / f"{job_id}{ext}"
-    contents  = await file_obj.read()
     with open(save_path, "wb") as fp:
-        fp.write(contents)
+        fp.write(await file_obj.read())
 
-    # ── Save RFP record to DB ─────────────────────────────────────────────────
     rfp = RFP(
-        # Leave blank if user didn't fill it — pipeline will auto-extract from document
         opportunity_name=opportunity_name or "",
-        client_name=client_name,
-        bu=bu,
-        classification=bu_code,
-        state=state,
-        country=country,
-        offering=json.dumps(resolved_offerings, ensure_ascii=False),
-        solutions=json.dumps(resolved_solutions, ensure_ascii=False),
-        file_name=file_obj.filename,
-        job_id=job_id,
-        status="queued",
-        progress=0,
-        uploaded_by=current_user.id,
+        client_name=client_name, bu=bu, classification=bu_code,
+        state=state, country=country,
+        offering=json.dumps(resolved_off, ensure_ascii=False),
+        solutions=json.dumps(resolved_sol, ensure_ascii=False),
+        file_name=file_obj.filename, job_id=job_id,
+        status="queued", progress=0, uploaded_by=current_user.id,
     )
     db.add(rfp)
     db.commit()
     db.refresh(rfp)
 
     background_tasks.add_task(run_pipeline_task, rfp.id, str(save_path), job_id)
-
     return {"job_id": job_id, "rfp_id": rfp.id, "status": "queued"}
 
 
@@ -506,13 +540,10 @@ def get_status(
     current_user: User = Depends(get_current_user),
 ):
     rfp = db.query(RFP).filter(RFP.id == rfp_id).first()
-    if not rfp:
-        raise HTTPException(404, "RFP not found")
+    if not rfp: raise HTTPException(404, "RFP not found")
     return {
-        "rfp_id": rfp.id,
-        "status": rfp.status,
-        "progress": rfp.progress,
-        "current_step": rfp.current_step,
+        "rfp_id": rfp.id, "status": rfp.status,
+        "progress": rfp.progress, "current_step": rfp.current_step,
         "error_message": rfp.error_message,
     }
 
@@ -524,8 +555,7 @@ def get_rfp(
     current_user: User = Depends(get_current_user),
 ):
     rfp = db.query(RFP).filter(RFP.id == rfp_id).first()
-    if not rfp:
-        raise HTTPException(404, "RFP not found")
+    if not rfp: raise HTTPException(404, "RFP not found")
     return rfp_to_dict(rfp, include_clauses=True, viewer_role=current_user.role)
 
 
@@ -536,11 +566,11 @@ def mark_complete(
     current_user: User = Depends(require_admin),
 ):
     rfp = db.query(RFP).filter(RFP.id == rfp_id).first()
-    if not rfp:
-        raise HTTPException(404, "RFP not found")
+    if not rfp: raise HTTPException(404, "RFP not found")
     rfp.status = "completed"
     db.commit()
     return {"status": "completed"}
+
 
 @router.patch("/rfps/{rfp_id}")
 async def update_rfp(
@@ -549,73 +579,35 @@ async def update_rfp(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    """
-    Update editable metadata fields on an existing RFP.
-    Accepts JSON body with any subset of: opportunity_name, client_name,
-    bu, bu_code, state, offering, solution, offerings_json, solutions_json
-    """
     rfp = db.query(RFP).filter(RFP.id == rfp_id).first()
-    if not rfp:
-        raise HTTPException(404, "RFP not found")
-
+    if not rfp: raise HTTPException(404, "RFP not found")
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(400, "Request body must be valid JSON")
 
-    def _parse_arr(raw):
-        if not raw:
-            return []
-        if isinstance(raw, list):
-            return [str(x).strip() for x in raw if x and str(x).strip()]
+    def _pa(raw):
+        if not raw: return []
+        if isinstance(raw, list): return [str(x).strip() for x in raw if x]
         raw = str(raw).strip()
         if raw.startswith("["):
-            try:
-                return [str(x).strip() for x in json.loads(raw) if x]
-            except Exception:
-                pass
+            try: return [str(x).strip() for x in json.loads(raw) if x]
+            except Exception: pass
         return [raw] if raw else []
 
-    if "opportunity_name" in body:
-        rfp.opportunity_name = str(body["opportunity_name"]).strip()
-    if "client_name" in body:
-        rfp.client_name = str(body["client_name"]).strip()
-    if "bu" in body:
-        rfp.bu = str(body["bu"]).strip()
+    for field in ["opportunity_name", "client_name", "bu", "state", "country"]:
+        if field in body:
+            setattr(rfp, field, str(body[field]).strip())
     if "bu_code" in body or "classification" in body:
         rfp.classification = str(body.get("bu_code") or body.get("classification", "")).strip()
-    if "state" in body:
-        rfp.state = str(body["state"]).strip()
-    if "country" in body:
-        rfp.country = str(body["country"]).strip()
-
-    # Offerings / solutions update
-    new_offerings = None
-    new_solutions  = None
-
-    if "offerings_json" in body:
-        new_offerings = _parse_arr(body["offerings_json"])
-    elif "offerings" in body:
-        new_offerings = _parse_arr(body["offerings"])
-    elif "offering" in body:
-        new_offerings = _parse_arr(body["offering"])
-
-    if "solutions_json" in body:
-        new_solutions = _parse_arr(body["solutions_json"])
-    elif "solutions" in body:
-        new_solutions = _parse_arr(body["solutions"])
-    elif "solution" in body:
-        new_solutions = _parse_arr(body["solution"])
-
-    if new_offerings is not None:
-        rfp.offering = json.dumps(new_offerings[:5], ensure_ascii=False)
-    if new_solutions is not None:
-        rfp.solutions = json.dumps(new_solutions[:5], ensure_ascii=False)
+    new_off = _pa(body.get("offerings_json") or body.get("offerings") or body.get("offering"))
+    new_sol = _pa(body.get("solutions_json") or body.get("solutions") or body.get("solution"))
+    if new_off: rfp.offering  = json.dumps(new_off[:5], ensure_ascii=False)
+    if new_sol: rfp.solutions = json.dumps(new_sol[:5], ensure_ascii=False)
 
     db.commit()
     db.refresh(rfp)
-    return rfp_to_dict(rfp, include_clauses=False, viewer_role=current_user.role)
-
+    return rfp_to_dict(rfp, viewer_role=current_user.role)
 
 
 @router.get("/rfps/{rfp_id}/download")
@@ -625,22 +617,18 @@ def download_rfp(
     current_user: User = Depends(get_current_user),
 ):
     rfp = db.query(RFP).filter(RFP.id == rfp_id).first()
-    if not rfp:
-        raise HTTPException(404, "RFP not found")
-
-    output_path = OUTPUT_DIR / f"{rfp.job_id}_ssc1.docx"
-    if not output_path.exists():
-        raise HTTPException(404, "Output file not ready yet. Run analysis first.")
-
+    if not rfp: raise HTTPException(404, "RFP not found")
+    out = OUTPUT_DIR / f"{rfp.job_id}_ssc1.docx"
+    if not out.exists(): raise HTTPException(404, "Output not ready yet.")
     return FileResponse(
-        path=str(output_path),
+        str(out),
         filename=f"SSC1_Review_{rfp.opportunity_name[:30]}.docx",
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# COMMENTS ROUTES
+# COMMENTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/rfps/{rfp_id}/comments")
@@ -653,18 +641,15 @@ def get_comments(
     q = db.query(Comment).filter(Comment.rfp_id == rfp_id)
     if clause:
         q = q.filter(Comment.clause_type == clause)
-    comments = q.order_by(Comment.created_at.asc()).all()
     return [
         {
-            "id": c.id,
-            "clause_type": c.clause_type,
-            "user_id": c.user_id,
+            "id": c.id, "clause_type": c.clause_type, "user_id": c.user_id,
             "user_name": c.user.name if c.user else "Unknown",
             "user_role": c.user.role if c.user else "",
             "comment_text": c.comment_text,
             "created_at": c.created_at.isoformat() if c.created_at else None,
         }
-        for c in comments
+        for c in q.order_by(Comment.created_at.asc()).all()
     ]
 
 
@@ -675,55 +660,405 @@ def post_comment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    rfp = db.query(RFP).filter(RFP.id == rfp_id).first()
-    if not rfp:
+    if not db.query(RFP).filter(RFP.id == rfp_id).first():
         raise HTTPException(404, "RFP not found")
-
-    comment = Comment(
-        rfp_id=rfp_id,
-        clause_type=body.clause_type,
-        user_id=current_user.id,
-        comment_text=body.comment_text,
+    c = Comment(
+        rfp_id=rfp_id, clause_type=body.clause_type,
+        user_id=current_user.id, comment_text=body.comment_text,
     )
-    db.add(comment)
+    db.add(c)
     db.commit()
-    db.refresh(comment)
-
+    db.refresh(c)
     return {
-        "id": comment.id,
-        "clause_type": comment.clause_type,
-        "user_id": comment.user_id,
-        "user_name": current_user.name,
-        "user_role": current_user.role,
-        "comment_text": comment.comment_text,
-        "created_at": comment.created_at.isoformat(),
+        "id": c.id, "clause_type": c.clause_type, "user_id": c.user_id,
+        "user_name": current_user.name, "user_role": current_user.role,
+        "comment_text": c.comment_text, "created_at": c.created_at.isoformat(),
     }
 
 
 @router.delete("/rfps/{rfp_id}/comments/{comment_id}")
 def delete_comment(
-    rfp_id: int,
-    comment_id: int,
+    rfp_id: int, comment_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    comment = db.query(Comment).filter(
-        Comment.id == comment_id,
-        Comment.rfp_id == rfp_id
+    c = db.query(Comment).filter(
+        Comment.id == comment_id, Comment.rfp_id == rfp_id,
     ).first()
-    if not comment:
-        raise HTTPException(404, "Comment not found")
-
-    if current_user.role != "admin" and comment.user_id != current_user.id:
-        raise HTTPException(403, "Not allowed to delete this comment")
-
-    db.delete(comment)
+    if not c: raise HTTPException(404, "Comment not found")
+    if current_user.role != "admin" and c.user_id != current_user.id:
+        raise HTTPException(403, "Not allowed")
+    db.delete(c)
     db.commit()
     return {"deleted": True}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# USERS ROUTES (admin only)
+# FEEDBACK — submit, view, retract
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/rfps/{rfp_id}/clauses/{clause_type}/feedback")
+def submit_feedback(
+    rfp_id: int,
+    clause_type: str,
+    body: FeedbackRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Submit or update feedback for one clause. One record per user per clause
+    per RFP (upsert — re-submitting overwrites the previous response).
+
+    If feedback_comment is provided on a non-agree submission, a
+    LearningExample is created automatically and will be injected into
+    future LLM prompts for matching offering/solution/clause combinations.
+    """
+    if clause_type not in VALID_CLAUSE_TYPES:
+        raise HTTPException(400, "Unknown clause type.")
+    if body.agreement not in VALID_AGREEMENTS:
+        raise HTTPException(400, f"Invalid agreement value: {body.agreement}")
+    if body.suggested_risk_level and body.suggested_risk_level not in VALID_RISK_LEVELS:
+        raise HTTPException(400, f"Invalid risk level: {body.suggested_risk_level}")
+
+    rfp = db.query(RFP).filter(RFP.id == rfp_id).first()
+    if not rfp: raise HTTPException(404, "RFP not found")
+
+    cr = db.query(ClauseResult).filter(
+        ClauseResult.rfp_id == rfp_id,
+        ClauseResult.clause_type == clause_type,
+    ).first()
+    system_risk = cr.risk_level if cr else "UNKNOWN"
+
+    offerings, solutions = _parse_offering_solutions(rfp.offering or "", rfp.solutions or "")
+    off = offerings[0] if offerings else ""
+    sol = solutions[0] if solutions else ""
+
+    # Upsert — one feedback per user per clause per RFP
+    existing = db.query(ClauseFeedback).filter(
+        ClauseFeedback.rfp_id == rfp_id,
+        ClauseFeedback.clause_type == clause_type,
+        ClauseFeedback.user_id == current_user.id,
+    ).first()
+
+    if existing:
+        existing.agreement            = body.agreement
+        existing.suggested_risk_level = body.suggested_risk_level
+        existing.feedback_comment     = body.feedback_comment
+        existing.system_risk_level    = system_risk
+        existing.offering             = off
+        existing.solution             = sol
+        existing.bu                   = rfp.bu or ""
+        existing.created_at           = datetime.utcnow()
+        db.commit()
+        db.refresh(existing)
+        fb = existing
+        action = "updated"
+    else:
+        fb = ClauseFeedback(
+            rfp_id=rfp_id,
+            clause_result_id=cr.id if cr else None,
+            clause_type=clause_type,
+            user_id=current_user.id,
+            offering=off, solution=sol, bu=rfp.bu or "",
+            agreement=body.agreement,
+            suggested_risk_level=body.suggested_risk_level,
+            feedback_comment=body.feedback_comment,
+            system_risk_level=system_risk,
+        )
+        db.add(fb)
+        db.commit()
+        db.refresh(fb)
+        action = "created"
+
+    # Auto-create LearningExample from high-quality feedback (comment + disagreement)
+    if body.feedback_comment and body.agreement != "agree":
+        try:
+            from rules.learning_store import create_learning_example
+            snippet = cr.clause_text[:300] if cr and cr.clause_text else ""
+            if create_learning_example(fb.id, db, clause_snippet=snippet):
+                print(f"[Feedback] Learning example created: {clause_type} / {off}")
+        except Exception as le:
+            print(f"[Feedback] Learning example skipped: {le}")
+
+    print(f"[Feedback] {action.upper()} — {current_user.email!r} "
+          f"rfp={rfp_id} {clause_type!r} {body.agreement!r} "
+          f"offering={off!r} solution={sol!r}")
+
+    return {**feedback_to_dict(fb), "action": action}
+
+
+@router.get("/rfps/{rfp_id}/clauses/{clause_type}/feedback")
+def get_clause_feedback(
+    rfp_id: int,
+    clause_type: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Admins see all feedback for the clause.
+    Reviewers see only their own.
+    Both see the aggregate breakdown.
+    """
+    if clause_type not in VALID_CLAUSE_TYPES:
+        raise HTTPException(400, "Unknown clause type.")
+
+    q = db.query(ClauseFeedback).filter(
+        ClauseFeedback.rfp_id == rfp_id,
+        ClauseFeedback.clause_type == clause_type,
+    )
+    if current_user.role != "admin":
+        q = q.filter(ClauseFeedback.user_id == current_user.id)
+    feedbacks = q.order_by(ClauseFeedback.created_at.asc()).all()
+
+    all_fb = db.query(ClauseFeedback).filter(
+        ClauseFeedback.rfp_id == rfp_id,
+        ClauseFeedback.clause_type == clause_type,
+    ).all()
+    from collections import Counter
+    breakdown = dict(Counter(f.agreement for f in all_fb))
+
+    return {
+        "clause_type": clause_type, "rfp_id": rfp_id,
+        "total_feedback": len(all_fb),
+        "breakdown": breakdown,
+        "my_feedback": next(
+            (feedback_to_dict(f) for f in feedbacks if f.user_id == current_user.id), None
+        ),
+        "all_feedback": [feedback_to_dict(f) for f in feedbacks],
+    }
+
+
+@router.get("/rfps/{rfp_id}/feedback")
+def get_rfp_feedback_summary(
+    rfp_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Summary across all 10 clauses — useful for a review completion tracker."""
+    if not db.query(RFP).filter(RFP.id == rfp_id).first():
+        raise HTTPException(404, "RFP not found")
+
+    all_fb = db.query(ClauseFeedback).filter(ClauseFeedback.rfp_id == rfp_id).all()
+    from collections import defaultdict, Counter
+    by_clause = defaultdict(list)
+    for fb in all_fb:
+        by_clause[fb.clause_type].append(fb)
+
+    summary = {}
+    for ct, fbs in by_clause.items():
+        my = next((f for f in fbs if f.user_id == current_user.id), None)
+        summary[ct] = {
+            "total": len(fbs),
+            "breakdown": dict(Counter(f.agreement for f in fbs)),
+            "my_agreement": my.agreement if my else None,
+            "my_suggested_level": my.suggested_risk_level if my else None,
+        }
+
+    my_done = {fb.clause_type for fb in all_fb if fb.user_id == current_user.id}
+    return {
+        "rfp_id": rfp_id,
+        "total_clauses": len(VALID_CLAUSE_TYPES),
+        "my_feedback_count": len(my_done),
+        "my_clauses_done": sorted(my_done),
+        "clauses_pending": sorted(VALID_CLAUSE_TYPES - my_done),
+        "by_clause": summary,
+    }
+
+
+@router.delete("/rfps/{rfp_id}/clauses/{clause_type}/feedback")
+def delete_my_feedback(
+    rfp_id: int,
+    clause_type: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    fb = db.query(ClauseFeedback).filter(
+        ClauseFeedback.rfp_id == rfp_id,
+        ClauseFeedback.clause_type == clause_type,
+        ClauseFeedback.user_id == current_user.id,
+    ).first()
+    if not fb: raise HTTPException(404, "No feedback found to retract")
+    db.delete(fb)
+    db.commit()
+    return {"deleted": True}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FEEDBACK INSIGHTS + AUDIT LOG (admin only)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/feedback/insights")
+def feedback_insights(
+    clause_type: Optional[str] = Query(None),
+    offering: Optional[str]    = Query(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """
+    Aggregated view of where feedback consensus exists.
+    has_strong_signal=True means the feedback engine WILL apply an adjustment
+    to the next RFP analysed for that offering/solution/clause combination.
+    """
+    from rules.feedback_engine import get_feedback_insights, CONSENSUS_THRESHOLD, MIN_FEEDBACK
+    insights = get_feedback_insights(db)
+    if clause_type:
+        insights = [i for i in insights if i["clause_type"] == clause_type]
+    if offering:
+        insights = [i for i in insights if offering.upper() in i["offering"]]
+    return {
+        "settings": {
+            "min_feedback_required": MIN_FEEDBACK,
+            "consensus_threshold_pct": int(CONSENSUS_THRESHOLD * 100),
+        },
+        "total_groups": len(insights),
+        "insights": insights,
+    }
+
+
+@router.get("/feedback/log")
+def feedback_log(
+    clause_type: Optional[str] = Query(None),
+    offering: Optional[str]    = Query(None),
+    user_id: Optional[int]     = Query(None),
+    limit: int                 = Query(100, le=500),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Full paginated audit log with user attribution."""
+    q = db.query(ClauseFeedback)
+    if clause_type: q = q.filter(ClauseFeedback.clause_type == clause_type)
+    if offering:    q = q.filter(ClauseFeedback.offering.ilike(f"%{offering}%"))
+    if user_id:     q = q.filter(ClauseFeedback.user_id == user_id)
+    return [
+        feedback_to_dict(fb)
+        for fb in q.order_by(ClauseFeedback.created_at.desc()).limit(limit).all()
+    ]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LEARNED RULES — synthesise + manage
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/feedback/synthesise")
+def synthesise_rule(
+    body: SynthesiseRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """
+    Trigger LLM rule synthesis for a specific (offering, solution, clause_type).
+
+    The model reads all accumulated feedback + reviewer comments and rewrites
+    the evaluation criteria for that context. The result is stored as a
+    LearnedRule and applied automatically on all future pipeline runs for
+    matching offering/solution combinations.
+
+    Requires at least 5 feedback entries (use force=True to bypass).
+    """
+    from rules.learning_store import synthesise_rule as _synth
+    return _synth(
+        clause_type=body.clause_type,
+        offering=body.offering,
+        solution=body.solution,
+        db=db,
+        force=body.force,
+    )
+
+
+@router.get("/feedback/rules")
+def list_rules(
+    clause_type: Optional[str] = Query(None),
+    offering: Optional[str]    = Query(None),
+    active_only: bool          = Query(False),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """List all synthesised learned rules."""
+    q = db.query(LearnedRule)
+    if clause_type: q = q.filter(LearnedRule.clause_type == clause_type)
+    if offering:    q = q.filter(LearnedRule.offering.ilike(f"%{offering.upper()}%"))
+    if active_only: q = q.filter(LearnedRule.is_active == True)
+    return [
+        rule_to_dict(r)
+        for r in q.order_by(LearnedRule.generated_at.desc()).all()
+    ]
+
+
+@router.patch("/feedback/rules/{rule_id}")
+def update_rule(
+    rule_id: int,
+    body: RuleUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """
+    Activate or deactivate a learned rule, or manually override its text.
+    Deactivating is reversible — the rule is kept for history.
+    """
+    r = db.query(LearnedRule).filter(LearnedRule.id == rule_id).first()
+    if not r: raise HTTPException(404, "Rule not found")
+    if body.is_active is not None: r.is_active = body.is_active
+    if body.rule_text:             r.rule_text  = body.rule_text
+    db.commit()
+    db.refresh(r)
+    return rule_to_dict(r)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LEARNING EXAMPLES — view + manage
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/feedback/examples")
+def list_examples(
+    clause_type: Optional[str] = Query(None),
+    offering: Optional[str]    = Query(None),
+    active_only: bool          = Query(True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """
+    List curated few-shot examples currently being injected into LLM prompts.
+    active_only=True (default) shows only examples currently in use.
+    """
+    q = db.query(LearningExample)
+    if clause_type: q = q.filter(LearningExample.clause_type == clause_type)
+    if offering:    q = q.filter(LearningExample.offering.ilike(f"%{offering.upper()}%"))
+    if active_only: q = q.filter(LearningExample.is_active == True)
+    return [
+        example_to_dict(e)
+        for e in q.order_by(
+            LearningExample.usefulness_score.desc(),
+            LearningExample.created_at.desc(),
+        ).all()
+    ]
+
+
+@router.patch("/feedback/examples/{example_id}")
+def update_example(
+    example_id: int,
+    body: ExampleUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """
+    Promote a high-quality example (usefulness_score 1 → 2 or 3) so it
+    appears earlier in prompts, or deactivate a poor one.
+    """
+    e = db.query(LearningExample).filter(LearningExample.id == example_id).first()
+    if not e: raise HTTPException(404, "Example not found")
+    if body.is_active is not None:
+        e.is_active = body.is_active
+    if body.usefulness_score is not None:
+        if body.usefulness_score not in (1, 2, 3):
+            raise HTTPException(400, "usefulness_score must be 1, 2, or 3")
+        e.usefulness_score = body.usefulness_score
+    db.commit()
+    db.refresh(e)
+    return example_to_dict(e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# USERS (admin only)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/users")
@@ -743,18 +1078,15 @@ def create_user(
     if db.query(User).filter(User.email == body.email).first():
         raise HTTPException(400, "Email already registered")
     if body.role not in ("admin", "reviewer"):
-        raise HTTPException(400, "Role must be 'admin' or 'reviewer'")
-
-    user = User(
-        name=body.name,
-        email=body.email,
-        password_hash=hash_password(body.password),
-        role=body.role,
+        raise HTTPException(400, "Role must be admin or reviewer")
+    u = User(
+        name=body.name, email=body.email,
+        password_hash=hash_password(body.password), role=body.role,
     )
-    db.add(user)
+    db.add(u)
     db.commit()
-    db.refresh(user)
-    return user_to_dict(user)
+    db.refresh(u)
+    return user_to_dict(u)
 
 
 @router.delete("/users/{user_id}")
@@ -765,9 +1097,81 @@ def delete_user(
 ):
     if user_id == current_user.id:
         raise HTTPException(400, "Cannot delete yourself")
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(404, "User not found")
-    db.delete(user)
+    u = db.query(User).filter(User.id == user_id).first()
+    if not u: raise HTTPException(404, "User not found")
+    db.delete(u)
     db.commit()
     return {"deleted": True}
+
+# ── DELETE any feedback record (admin) ────────────────────────────────────────
+
+@router.delete("/feedback/{feedback_id}")
+def admin_delete_feedback(
+    feedback_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Admin: delete any single feedback record by ID."""
+    fb = db.query(ClauseFeedback).filter(ClauseFeedback.id == feedback_id).first()
+    if not fb:
+        raise HTTPException(404, "Feedback not found")
+    db.delete(fb)
+    db.commit()
+    return {"deleted": True, "feedback_id": feedback_id}
+
+
+# ── RESET all feedback for one RFP (admin) ────────────────────────────────────
+
+@router.delete("/rfps/{rfp_id}/feedback")
+def reset_rfp_feedback(
+    rfp_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Admin: wipe ALL feedback (+ learning examples) for one RFP. Useful for mock resets."""
+    # Delete learning examples linked to this RFP's feedback
+    fb_ids = [
+        row.id for row in
+        db.query(ClauseFeedback).filter(ClauseFeedback.rfp_id == rfp_id).all()
+    ]
+    if fb_ids:
+        db.query(LearningExample).filter(
+            LearningExample.feedback_id.in_(fb_ids)
+        ).delete(synchronize_session=False)
+
+    count = db.query(ClauseFeedback).filter(
+        ClauseFeedback.rfp_id == rfp_id
+    ).delete(synchronize_session=False)
+    db.commit()
+    return {"deleted": count, "rfp_id": rfp_id}
+
+
+# ── NUKE all feedback + learning data globally (admin) ────────────────────────
+
+@router.delete("/feedback/reset-all")
+def reset_all_feedback(
+    confirm: str = Query(..., description="Must be 'yes-delete-everything'"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """
+    Admin: wipe ALL feedback, learning examples, and learned rules globally.
+    Requires ?confirm=yes-delete-everything as a safety guard.
+    Use this to reset mock/demo data.
+    """
+    if confirm != "yes-delete-everything":
+        raise HTTPException(400, "Pass ?confirm=yes-delete-everything to proceed.")
+
+    examples_deleted = db.query(LearningExample).delete(synchronize_session=False)
+    rules_deleted    = db.query(LearnedRule).delete(synchronize_session=False)
+    feedback_deleted = db.query(ClauseFeedback).delete(synchronize_session=False)
+    db.commit()
+
+    print(f"[RESET] Deleted {feedback_deleted} feedback, "
+          f"{examples_deleted} examples, {rules_deleted} rules")
+
+    return {
+        "feedback_deleted":  feedback_deleted,
+        "examples_deleted":  examples_deleted,
+        "rules_deleted":     rules_deleted,
+    }

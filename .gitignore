@@ -5,3 +5,5 @@ uploads/
 outputs/ 
 *.pdf 
 *.docx 
+__pycache__/ 
+*.pyc 
