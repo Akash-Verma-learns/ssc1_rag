@@ -2,6 +2,7 @@
 Auth
 ----
 Password hashing and JWT token creation/verification.
+Roles: admin | reviewer | tq_reviewer
 """
 
 import os
@@ -21,6 +22,8 @@ JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "24"))
 
 pwd_context   = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+VALID_ROLES = {"admin", "reviewer", "tq_reviewer"}
 
 
 def hash_password(password: str) -> str:
@@ -44,7 +47,7 @@ def decode_token(token: str) -> int:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
 
 
-# ── FastAPI dependency: get current logged-in user ────────────────────────────
+# ── FastAPI dependencies ───────────────────────────────────────────────────────
 
 def get_current_user(token: str = Depends(oauth2_scheme)):
     """Inject into any route to require authentication."""
@@ -64,4 +67,42 @@ def require_admin(current_user=Depends(get_current_user)):
     """Inject into any route to require admin role."""
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
+    return current_user
+
+
+def require_pq_access(current_user=Depends(get_current_user)):
+    """
+    Require PQ (SSC1) access.
+    Allowed: admin, reviewer
+    NOT allowed: tq_reviewer (TQ-only team)
+    """
+    if current_user.role not in ("admin", "reviewer"):
+        raise HTTPException(
+            status_code=403,
+            detail="PQ review access required. TQ reviewers cannot access the PQ section."
+        )
+    return current_user
+
+
+def require_tq_access(current_user=Depends(get_current_user)):
+    """
+    Require TQ (SSC2) access.
+    Allowed: admin, reviewer, tq_reviewer
+    All authenticated users can access TQ.
+    """
+    if current_user.role not in ("admin", "reviewer", "tq_reviewer"):
+        raise HTTPException(status_code=403, detail="Access denied")
+    return current_user
+
+
+def require_tq_or_admin(current_user=Depends(get_current_user)):
+    """
+    For TQ upload / trigger actions — admin and tq_reviewer only.
+    Regular PQ reviewers cannot upload proposals.
+    """
+    if current_user.role not in ("admin", "tq_reviewer"):
+        raise HTTPException(
+            status_code=403,
+            detail="TQ reviewer or admin access required to upload proposals."
+        )
     return current_user

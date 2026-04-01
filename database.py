@@ -7,11 +7,13 @@ Tables are auto-created on first run.
 Tables:
   users             — auth
   rfps              — uploaded tenders
-  clause_results    — extracted + risk-evaluated clause data
+  clause_results    — extracted + risk-evaluated clause data (SSC1/PQ)
   comments          — per-clause reviewer comments
   clause_feedback   — structured reviewer feedback
   learning_examples — curated few-shot examples for prompt injection
   learned_rules     — LLM-synthesised evaluation rules per offering/solution/clause
+  tq_evaluations    — SSC2: one TQ evaluation per RFP + proposal upload
+  tq_score_items    — SSC2: one scored criterion per evaluation
 """
 
 import os
@@ -53,7 +55,9 @@ class User(Base):
     name          = Column(String(100), nullable=False)
     email         = Column(String(150), unique=True, index=True, nullable=False)
     password_hash = Column(String(200), nullable=False)
-    role          = Column(Enum("admin", "reviewer", name="user_role"), default="reviewer")
+    # Roles: admin | reviewer | tq_reviewer
+    # Using String instead of Enum to avoid painful Postgres enum alteration
+    role          = Column(String(20), default="reviewer")
     created_at    = Column(DateTime, default=datetime.utcnow)
 
     rfps      = relationship("RFP", back_populates="uploaded_by_user")
@@ -82,10 +86,11 @@ class RFP(Base):
     uploaded_by      = Column(Integer, ForeignKey("users.id"))
     created_at       = Column(DateTime, default=datetime.utcnow)
 
-    uploaded_by_user = relationship("User", back_populates="rfps")
-    clause_results   = relationship("ClauseResult", back_populates="rfp", cascade="all, delete")
-    comments         = relationship("Comment", back_populates="rfp", cascade="all, delete")
-    feedbacks        = relationship("ClauseFeedback", back_populates="rfp", cascade="all, delete")
+    uploaded_by_user  = relationship("User", back_populates="rfps")
+    clause_results    = relationship("ClauseResult", back_populates="rfp", cascade="all, delete")
+    comments          = relationship("Comment", back_populates="rfp", cascade="all, delete")
+    feedbacks         = relationship("ClauseFeedback", back_populates="rfp", cascade="all, delete")
+    tq_evaluations    = relationship("TQEvaluation", back_populates="rfp", cascade="all, delete")
 
 
 class ClauseResult(Base):
@@ -97,20 +102,18 @@ class ClauseResult(Base):
     clause_text           = Column(Text)
     clause_reference      = Column(String(200))
     page_no               = Column(String(20))
-    risk_level            = Column(String(30))       # raw system assessment
+    risk_level            = Column(String(30))
     risk_description      = Column(Text)
     auto_remark           = Column(Text)
     needs_exception       = Column(Boolean, default=False)
     needs_eqcr            = Column(Boolean, default=False)
     deviation_suggested   = Column(Text)
 
-    # Feedback engine adjustments
     adjusted_risk_level   = Column(String(30), nullable=True)
     adjustment_reason     = Column(Text, nullable=True)
     adjustment_confidence = Column(String(10), nullable=True)
     feedback_count        = Column(Integer, default=0)
 
-    # Whether a learned rule influenced this result
     learned_rule_applied  = Column(Boolean, default=False)
     learned_rule_id       = Column(Integer, ForeignKey("learned_rules.id"), nullable=True)
 
@@ -135,18 +138,6 @@ class Comment(Base):
 
 
 class ClauseFeedback(Base):
-    """
-    Structured reviewer feedback on a single clause's risk assessment.
-
-    agreement values:
-      agree      — system is correct for this offering/solution
-      too_high   — system over-rated the risk for this type of work
-      too_low    — system under-rated the risk for this type of work
-      incorrect  — logic is wrong (free text comment explains why)
-
-    offering + solution are snapshotted at submission time so historical
-    feedback stays meaningful even if the RFP record is later edited.
-    """
     __tablename__ = "clause_feedback"
 
     id                   = Column(Integer, primary_key=True, index=True)
@@ -155,16 +146,11 @@ class ClauseFeedback(Base):
     clause_type          = Column(String(50), nullable=False, index=True)
     user_id              = Column(Integer, ForeignKey("users.id"), nullable=False)
 
-    # Context snapshot
     offering             = Column(String(500))
     solution             = Column(String(500))
     bu                   = Column(String(150))
 
-    # Feedback
-    agreement            = Column(
-        Enum("agree", "too_high", "too_low", "incorrect", name="feedback_agreement"),
-        nullable=False,
-    )
+    agreement            = Column(String(20), nullable=False)  # agree|too_high|too_low|incorrect
     suggested_risk_level = Column(String(30), nullable=True)
     feedback_comment     = Column(Text, nullable=True)
     system_risk_level    = Column(String(30), nullable=False)
@@ -180,15 +166,6 @@ class ClauseFeedback(Base):
 
 
 class LearningExample(Base):
-    """
-    Curated few-shot examples derived from reviewer feedback.
-
-    Injected into LLM extraction and risk-evaluation prompts when analysing
-    future RFPs that share the same offering/solution/clause_type context.
-    Created automatically on feedback submission (when comment is present).
-    Admins can deactivate low-quality examples or boost high-quality ones
-    via usefulness_score.
-    """
     __tablename__ = "learning_examples"
 
     id                 = Column(Integer, primary_key=True, index=True)
@@ -198,12 +175,12 @@ class LearningExample(Base):
     solution           = Column(String(500))
     bu                 = Column(String(150))
 
-    clause_snippet     = Column(Text)           # first 300 chars of extracted clause text
-    system_risk_level  = Column(String(30))     # what the model said
-    correct_risk_level = Column(String(30))     # what the reviewer said it should be
-    reviewer_reason    = Column(Text)           # the reviewer's comment
+    clause_snippet     = Column(Text)
+    system_risk_level  = Column(String(30))
+    correct_risk_level = Column(String(30))
+    reviewer_reason    = Column(Text)
 
-    usefulness_score   = Column(Integer, default=1)   # 1=normal, 2=high, 3=essential
+    usefulness_score   = Column(Integer, default=1)
     is_active          = Column(Boolean, default=True)
     created_at         = Column(DateTime, default=datetime.utcnow)
 
@@ -211,14 +188,6 @@ class LearningExample(Base):
 
 
 class LearnedRule(Base):
-    """
-    LLM-synthesised evaluation rules, generated from accumulated feedback
-    via POST /feedback/synthesise.
-
-    The rule_text overrides the static rule in risk_engine.py for the
-    specific (offering, solution, clause_type) combination it was generated
-    for. Admins can deactivate rules without deleting them.
-    """
     __tablename__ = "learned_rules"
 
     id                    = Column(Integer, primary_key=True, index=True)
@@ -227,13 +196,77 @@ class LearnedRule(Base):
     solution              = Column(String(500))
 
     rule_text             = Column(Text, nullable=False)
-    threshold_notes_json  = Column(Text)         # JSON: {HIGH: ..., MEDIUM: ..., ACCEPTABLE: ...}
-    key_differences       = Column(Text)         # how this differs from the static rule
-    confidence            = Column(String(10))   # HIGH / MEDIUM / LOW
+    threshold_notes_json  = Column(Text)
+    key_differences       = Column(Text)
+    confidence            = Column(String(10))
 
     feedback_count_at_gen = Column(Integer, default=0)
     is_active             = Column(Boolean, default=True)
     generated_at          = Column(DateTime, default=datetime.utcnow)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SSC2 / TQ Tables
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TQEvaluation(Base):
+    """
+    One TQ (Technical Qualification) evaluation per RFP + proposal upload.
+    Multiple evaluations per RFP are allowed (different proposals or re-runs).
+    The latest evaluation for an RFP is used in the review page.
+    """
+    __tablename__ = "tq_evaluations"
+
+    id                 = Column(Integer, primary_key=True, index=True)
+    rfp_id             = Column(Integer, ForeignKey("rfps.id"), nullable=False)
+    proposal_file_name = Column(String(300))        # original uploaded filename
+    proposal_doc_name  = Column(String(300))        # ChromaDB namespace key
+    evaluation_title   = Column(String(300), default="Technical Evaluation")
+    grand_total_marks  = Column(Integer, default=100)
+    total_scored       = Column(String(20), default="0")     # decimal stored as string
+    total_percentage   = Column(String(20), default="0")
+    status             = Column(String(30), default="queued")  # queued|processing|completed|failed
+    progress           = Column(Integer, default=0)
+    current_step       = Column(String(200), default="")
+    error_message      = Column(Text, nullable=True)
+    uploaded_by        = Column(Integer, ForeignKey("users.id"))
+    created_at         = Column(DateTime, default=datetime.utcnow)
+    completed_at       = Column(DateTime, nullable=True)
+
+    rfp      = relationship("RFP", back_populates="tq_evaluations")
+    uploader = relationship("User", foreign_keys=[uploaded_by])
+    scores   = relationship(
+        "TQScoreItem", back_populates="evaluation",
+        cascade="all, delete",
+        order_by="TQScoreItem.sort_order",
+    )
+
+
+class TQScoreItem(Base):
+    """
+    One scored criterion per TQEvaluation.
+    Sub-items are stored with is_sub_item=True and parent_parameter set.
+    This flat storage makes aggregation simple while the UI reconstructs hierarchy.
+    """
+    __tablename__ = "tq_score_items"
+
+    id                 = Column(Integer, primary_key=True, index=True)
+    evaluation_id      = Column(Integer, ForeignKey("tq_evaluations.id"), nullable=False)
+    item_code          = Column(String(20))
+    parameter          = Column(String(300))
+    max_marks          = Column(Integer, default=0)
+    score              = Column(String(20), default="0")         # decimal as string
+    score_percentage   = Column(String(20), default="0")
+    justification      = Column(Text)
+    strengths_json     = Column(Text, default="[]")              # JSON array
+    gaps_json          = Column(Text, default="[]")              # JSON array
+    evidence_found     = Column(Boolean, default=False)
+    is_sub_item        = Column(Boolean, default=False)
+    parent_parameter   = Column(String(300), default="")
+    criteria_text      = Column(Text)
+    sort_order         = Column(Integer, default=0)
+
+    evaluation = relationship("TQEvaluation", back_populates="scores")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -267,6 +300,7 @@ def init_db():
 def _safe_alter_columns():
     from sqlalchemy import text
     alterations = [
+        # SSC1 / PQ additions (existing)
         "ALTER TABLE rfps ADD COLUMN IF NOT EXISTS country VARCHAR(100)",
         "ALTER TABLE clause_results ADD COLUMN IF NOT EXISTS adjusted_risk_level VARCHAR(30)",
         "ALTER TABLE clause_results ADD COLUMN IF NOT EXISTS adjustment_reason TEXT",
@@ -274,13 +308,23 @@ def _safe_alter_columns():
         "ALTER TABLE clause_results ADD COLUMN IF NOT EXISTS feedback_count INTEGER DEFAULT 0",
         "ALTER TABLE clause_results ADD COLUMN IF NOT EXISTS learned_rule_applied BOOLEAN DEFAULT FALSE",
         "ALTER TABLE clause_results ADD COLUMN IF NOT EXISTS learned_rule_id INTEGER",
+
+        # SSC2 / TQ: migrate role column from Enum to VARCHAR if needed
+        # (safe to run multiple times — IF NOT EXISTS guards handle it)
+        "ALTER TABLE users ALTER COLUMN role TYPE VARCHAR(20)",
+
+        # SSC2 / TQ: ensure new columns exist if tables were created before this migration
+        "ALTER TABLE tq_evaluations ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP",
+        "ALTER TABLE tq_score_items ADD COLUMN IF NOT EXISTS criteria_text TEXT",
+        "ALTER TABLE tq_score_items ADD COLUMN IF NOT EXISTS parent_parameter VARCHAR(300) DEFAULT ''",
     ]
     try:
         with engine.connect() as conn:
             for stmt in alterations:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
+                except Exception as e:
+                    # Silently skip — column may already exist or type already correct
                     pass
             conn.commit()
     except Exception:
